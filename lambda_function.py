@@ -14,6 +14,7 @@ index = 'photos'
 
 url = ES_HOST + '/' + index + '/_search'
 
+# test tst tst
 def lambda_handler(event, context):
     # receive from API Gateway
     print("EVENT --- {}".format(json.dumps(event)))
