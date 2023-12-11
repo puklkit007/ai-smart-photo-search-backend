@@ -1,72 +1,98 @@
 import json
 import boto3
-from datetime import datetime
-import requests
-from requests_aws4auth import AWS4Auth
+import http.client
+import urllib.parse
+from botocore.auth import SigV4Auth
+from botocore.awsrequest import AWSRequest
+import base64
 
-ES_HOST = 'https://search-photos-o6ok35wchfkb5pu2z5se66bthm.aos.us-east-2.on.aws'
 
-def get_url(index):
-    return f'{ES_HOST}/{index}/_doc'
+region = 'us-east-2'
+service = 'es'
+s3_client = boto3.client('s3', region_name=region)
+rekognition = boto3.client('rekognition', region_name=region)
+
+# Elasticsearch domain 
+es_host = 'search-photos-o6ok35wchfkb5pu2z5se66bthm.us-east-2.es.amazonaws.com' 
+# Elasticsearch credentials
+es_username = 'pulkit'
+es_password = 'Qwerty@007'
+
+def get_signed_request(method, url, service, region, body=None):
+    headers = {'Content-Type': 'application/json'}
+    request = AWSRequest(method=method, url=url, data=body, headers=headers)
+    SigV4Auth(boto3.Session().get_credentials(), service, region).add_auth(request)
+    return request
 
 def lambda_handler(event, context):
-    print(f"EVENT --- {json.dumps(event)}")
+    # Extract bucket name and file key from the event
+    print("Received event:", json.dumps(event))
+    print("hello")
+    bucket = event['Records'][0]['s3']['bucket']['name']
+    key = urllib.parse.unquote_plus(event['Records'][0]['s3']['object']['key'])
 
-    rek = boto3.client('rekognition')
-
-    for record in event['Records']:
-        bucket = record['s3']['bucket']['name']
-        key = record['s3']['object']['key']
-        
-        print(bucket)
-        print(key)
-        
-        labels = rek.detect_labels(
+    try:
+        # Detect labels in the image
+        response = rekognition.detect_labels(
             Image={'S3Object': {'Bucket': bucket, 'Name': key}},
             MaxLabels=10
         )
-    
-    print(f"IMAGE LABELS --- {labels['Labels']}")
+        print("response from reko")
+        print(response)
 
-    obj = {
-        'objectKey': key,
-        'bucket': bucket,
-        'createdTimestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        'labels': [label['Name'] for label in labels['Labels']]
-    }
-    
-    print(f"JSON OBJECT --- {obj}")
-    
-    host = 'https://search-photos-o6ok35wchfkb5pu2z5se66bthm.us-east-2.es.amazonaws.com'
-    url = host + '/photos/' + '_doc/' + obj['objectKey']
-    headers = {'Content-Type': 'application/json'}
-    session = boto3.Session()
-    credentials = session.get_credentials()
-    current_credentials = credentials.get_frozen_credentials()
+        # Get metadata from S3 object
+        metadata_response = s3_client.head_object(Bucket=bucket, Key=key)
+        # print("response from metadata")
+        # print(metadata_response)
 
-    # Prepare the AWS authentication
-    awsauth = AWS4Auth(current_credentials.access_key,
-                       current_credentials.secret_key,
-                       session.region_name, 'es',
-                       session_token=current_credentials.token)
-    
-    response = requests.post(
-        url, auth=awsauth, headers=headers, json=obj)
-    # return response
+        custom_labels = metadata_response['Metadata'].get('customlabels', '[]')
+        
+        custom_labels = [label.strip() for label in custom_labels.split(',') if label.strip()]
+        
+        labels = [label['Name'] for label in response['Labels']]
+        all_labels = labels + custom_labels
+        
+        print("all_labels")
+        print(all_labels)
 
-    # url = get_url('photos')
-    # response = requests.post(url, json=obj, headers={"Content-Type": "application/json"})
-    
-    # print(f"Success: {response}")
-    
-    if response.status_code != 200:
-        print(f"Error: {response.status_code}")
-        print(f"Response Text: {response.text}")  # Print out the response text for debugging
-    else:
-        print(f"Success: {response}")
-    
-    return {
-        'statusCode': 200,
-        'headers': {"Access-Control-Allow-Origin": "*", 'Content-Type': 'application/json'},
-        'body': json.dumps("Image labels have been successfully detected!")
-    }
+        es_json = json.dumps({
+            "objectKey": key,
+            "bucket": bucket,
+            "createdTimestamp": metadata_response['LastModified'].strftime('%Y-%m-%dT%H:%M:%S'),
+            "labels": all_labels
+        })
+
+        es_url = f'https://{es_host}/photos/_doc/'
+        # Encode credentials for Basic Auth
+        credentials = f'{es_username}:{es_password}'
+        encoded_credentials = base64.b64encode(credentials.encode()).decode()
+
+        # Set up headers with Basic Auth
+        headers = {
+            'Authorization': f'Basic {encoded_credentials}',
+            'Content-Type': 'application/json'
+        }
+
+        signed_request = get_signed_request('POST', es_url, 'es', region, body=es_json)
+
+        # Make the HTTP request to Elasticsearch
+        connection = http.client.HTTPSConnection(es_host)
+        connection.request(method='POST', url=es_url, body=es_json, headers=headers)
+        response = connection.getresponse()
+        print("response from es ")
+        print(response)
+        response_body = response.read().decode()
+        print("Response Status Code:", response.status)
+        print("Response Body:", response_body)
+
+        return {
+            'statusCode': 200,
+            'headers': {"Access-Control-Allow-Origin": "*", 'Content-Type': 'application/json',
+                        "Access-Control-Allow-Headers": '*', "Access-Control-Allow-Methods": '*'
+                },
+            'body': json.dumps(f'Successfully indexed photo. Response: {response.read().decode()}')
+        }
+
+    except Exception as e:
+        print("Error: ", e)
+        raise e
